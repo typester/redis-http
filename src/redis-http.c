@@ -378,7 +378,8 @@ static void http_server_listen(http_server_t* server, uint16_t port) {
     if (sdslen(ports)) {
         int count, pair_count;
         sds* pairs = sdssplitlen(ports, sdslen(ports), ";", 1, &count);
-        for (int i = 0; i < count; i++) {
+        int i;
+        for (i = 0; i < count; i++) {
             sds* port_fd = sdssplitlen(pairs[i], sdslen(pairs[i]), "=", 1, &pair_count);
             if (pair_count < 2) {
                 sdsfreesplitres(port_fd, pair_count);
