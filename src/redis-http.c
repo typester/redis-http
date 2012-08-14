@@ -17,6 +17,7 @@
 #include "hiredis.h"
 #include "async.h"
 #include "adapters/libev.h"
+#include "sds.h"
 
 #include "ngx-queue.h"
 #include "buffer.h"
@@ -64,6 +65,11 @@ static const char* const OK_HDR =
     "HTTP/1.0 200 OK\r\n"
     "Connection: close\r\n";
 static const size_t OK_HDR_LEN = 36;
+
+void usage() {
+    fprintf(stderr,"Usage: ./redis-http --port 7777 --redis-port 8888\n");
+    exit(1);
+}
 
 static void redis_connect_cb(const redisAsyncContext *c, int status) {
     if (status != REDIS_OK) {
@@ -284,9 +290,62 @@ static void http_server_listen(http_server_t* server, uint16_t port) {
     ev_io_start(EV_DEFAULT_ &server->ev_read);
 }
 
-int main() {
+int main(int argc, char** argv) {
+    /* default options */
+    uint16_t port = 6380;
+    sds address   = sdsnew("0.0.0.0");
+
+    uint16_t redis_port = 6379;
+    sds redis_address   = sdsnew("127.0.0.1");
+
+    if (argc >= 2) {
+        int j = 1;
+        sds option = sdsempty();
+
+        /* Handle special options --help */
+        if (strcmp(argv[1], "--help") == 0 ||
+            strcmp(argv[1], "-h") == 0) usage();
+
+        while (j != argc) {
+            if (argv[j][0] == '-' && argv[j][1] == '-') {
+                /* Option name */
+                if (sdslen(option)) {
+                    fprintf(stderr, "Argument missing for option %s\n", option);
+                    usage();
+                }
+                option = sdscat(option, argv[j] + 2);
+            }
+            else {
+                /* Option argument */
+                if (!sdslen(option)) {
+                    fprintf(stderr, "Invalid arguments: %s\n", argv[j]);
+                    usage();
+                }
+
+                if (0 == strcmp(option, "port")) {
+                    port = atoi(argv[j]);
+                }
+                else if (0 == strcmp(option, "address")) {
+                    sdsfree(address);
+                    address = sdsnew(argv[j]);
+                }
+                else if (0 == strcmp(option, "redis-port")) {
+                    redis_port = atoi(argv[j]);
+                }
+                else if (0 == strcmp(option, "redis-address")) {
+                    sdsfree(redis_address);
+                    redis_address = sdsnew(argv[j]);
+                }
+
+                sdsfree(option);
+                option = sdsempty();
+            }
+            j++;
+        }
+    }
+
     /* redis client */
-    redisAsyncContext* c = redisAsyncConnect("127.0.0.1", 6379);
+    redisAsyncContext* c = redisAsyncConnect(redis_address, redis_port);
     if (c->err) {
         fprintf(stderr, "Error: %s\n", c->errstr);
         return -1;
@@ -300,7 +359,7 @@ int main() {
     http_server_t* server = http_server_init();
     assert(server);
 
-    http_server_listen(server, 9999);
+    http_server_listen(server, port);
 
     server->data = (void*)c;
 
