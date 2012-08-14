@@ -13,6 +13,7 @@
 #include <stddef.h>
 #include <string.h>
 #include <sys/uio.h>
+#include <signal.h>
 
 #include "hiredis.h"
 #include "async.h"
@@ -32,12 +33,16 @@ static sds redis_address;
 typedef struct http_server_s http_server_t;
 typedef struct http_conn_s http_conn_t;
 
+/* global server */
+static http_server_t* instance;
+
 struct http_server_s {
     int fd;
     ngx_queue_t connections;
     ev_io ev_read;
     ev_timer reconnect_timer;
 
+    int closing;
     void* data;
 };
 
@@ -48,7 +53,6 @@ struct http_conn_s {
     int fd;
     ngx_queue_t queue;
     ev_io ev_read;
-    ev_io ev_write;
     buffer* rbuf;
 
     int flags;
@@ -156,7 +160,8 @@ static void redis_disconnect_cb(const redisAsyncContext* c, int status) {
     http_server_t* server = (http_server_t*)c->data;
     server->data = NULL;
 
-    redis_reconnect(server);
+    if (0 == server->closing)
+        redis_reconnect(server);
 }
 
 static void redis_data_cb(redisAsyncContext* c, void* r, void* privdata) {
@@ -313,6 +318,7 @@ static http_server_t* http_server_init() {
     assert(server);
 
     server->fd = 0;
+    server->closing = 0;
     ngx_queue_init(&server->connections);
 
     ev_timer_init(&server->reconnect_timer, redis_reconnect_cb, 2., 0.);
@@ -343,10 +349,26 @@ static void http_conn_close(http_conn_t* conn) {
 #ifdef DEBUG
     fprintf(stderr, "close conn: %d\n", conn->fd);
 #endif
+
+    http_server_t* server = conn->server;
+
     ngx_queue_remove(&conn->queue);
     close(conn->fd);
     buffer_free(conn->rbuf);
     free(conn);
+
+    if (server->closing && ngx_queue_empty(&server->connections)) {
+        /* stop server */
+        fprintf(stderr, "stopping server\n");
+        redisAsyncContext* c = (redisAsyncContext*)server->data;
+        if (c) {
+            redisAsyncFree(c);
+        }
+
+        ev_io_stop(EV_DEFAULT_ &server->ev_read);
+        ev_timer_stop(EV_DEFAULT_ &server->reconnect_timer);
+        close(server->fd);
+    }
 }
 
 static void http_server_listen(http_server_t* server, uint16_t port) {
@@ -373,6 +395,26 @@ static void http_server_listen(http_server_t* server, uint16_t port) {
     server->fd = listen_sock;
     ev_io_init(&server->ev_read, http_acccept_cb, listen_sock, EV_READ);
     ev_io_start(EV_DEFAULT_ &server->ev_read);
+}
+
+static void sigterm_cb(EV_P_ ev_async* w, int revents) {
+    fprintf(stderr, "here\n");
+    http_server_t* server = (http_server_t*)w->data;
+    server->closing = 1;
+}
+
+static void sigtermHandler(int sig) {
+    printf("Received SIGTERM, scheduling shutdown...\n");
+    http_server_t* s = instance;
+    s->closing = 1;
+
+    if (ngx_queue_empty(&s->connections)) {
+        redisAsyncContext* c = (redisAsyncContext*)s->data;
+        if (c) redisAsyncFree(c);
+
+        ev_io_stop(EV_DEFAULT_ &s->ev_read);
+        close(s->fd);
+    }
 }
 
 int main(int argc, char** argv) {
@@ -440,9 +482,20 @@ int main(int argc, char** argv) {
     http_server_listen(server, http_port);
 
     c->data = (void*)server;
+    instance = server;
 
     printf("Launched redis-http (%s:%d) proxying redis (%s:%d)\n",
         http_address, http_port, redis_address, redis_port);
+
+
+    signal(SIGHUP, SIG_IGN);
+    signal(SIGPIPE, SIG_IGN);
+
+    struct sigaction act;
+    sigemptyset(&act.sa_mask);
+    act.sa_flags = 0;
+    act.sa_handler = sigtermHandler;
+    sigaction(SIGTERM, &act, NULL);
 
     /* main loop */
     ev_loop(EV_DEFAULT_ 0);
