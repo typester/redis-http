@@ -56,15 +56,21 @@ static const char* const BAD_REQUEST =
     "HTTP/1.0 400 Bad Request\r\n"
     "Content-Type: text/plain\r\n"
     "Content-Length: 11\r\n"
-    "Connection: close\r\n"
     "\r\n"
     "Bad Request";
-static const size_t BAD_REQUEST_LEN = 104;
+static const size_t BAD_REQUEST_LEN = 85;
+
+static const char* const NOT_FOUND =
+    "HTTP/1.0 404 Not Found\r\n"
+    "Content-Type: text/plain\r\n"
+    "Content-Length: 9\r\n"
+    "\r\n"
+    "Not Found";
+static const size_t NOT_FOUND_LEN = 80;
 
 static const char* const OK_HDR =
-    "HTTP/1.0 200 OK\r\n"
-    "Connection: close\r\n";
-static const size_t OK_HDR_LEN = 36;
+    "HTTP/1.0 200 OK\r\n";
+static const size_t OK_HDR_LEN = 17;
 
 void usage() {
     fprintf(stderr,"Usage: ./redis-http --port 7777 --redis-port 8888\n");
@@ -107,20 +113,24 @@ static void redis_data_cb(redisAsyncContext* c, void* r, void* privdata) {
         return;
     }
 
-    struct iovec v[3];
-    v[0].iov_base = (char*)OK_HDR;
-    v[0].iov_len  = OK_HDR_LEN;
+    if (0 == reply->len) {
+        write(conn->fd, NOT_FOUND, NOT_FOUND_LEN);
+    }
+    else {
+        struct iovec v[3];
+        v[0].iov_base = (char*)OK_HDR;
+        v[0].iov_len  = OK_HDR_LEN;
 
-    char content_length[64];
-    snprintf(content_length, 64, "Content-Length: %d\r\n\r\n", reply->len);
-    v[1].iov_base = content_length;
-    v[1].iov_len  = strlen(content_length);
+        char content_length[64];
+        snprintf(content_length, 64, "Content-Length: %d\r\n\r\n", reply->len);
+        v[1].iov_base = content_length;
+        v[1].iov_len  = strlen(content_length);
 
-    v[2].iov_base = reply->str;
-    v[2].iov_len  = reply->len;
+        v[2].iov_base = reply->str;
+        v[2].iov_len  = reply->len;
 
-    writev(conn->fd, v, 3);
-
+        writev(conn->fd, v, 3);
+    }
     http_conn_close(conn);
 }
 
