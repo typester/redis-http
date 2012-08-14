@@ -436,7 +436,7 @@ static void http_server_listen(http_server_t* server) {
 
             struct sockaddr_un listen_addr;
             memset(&listen_addr, 0, sizeof(listen_addr));
-            strlcpy(listen_addr.sun_path, http_socket, sizeof(listen_addr.sun_path));
+            strncpy(listen_addr.sun_path, http_socket, sizeof(listen_addr.sun_path) - 1);
             listen_addr.sun_family = AF_UNIX;
             unlink(listen_addr.sun_path);
             r = bind(listen_sock, (struct sockaddr*)&listen_addr, sizeof(listen_addr));
