@@ -1,3 +1,9 @@
 [submodule "deps/hiredis"]
 	path = deps/hiredis
 	url = git://github.com/antirez/hiredis.git
+[submodule "deps/buffer"]
+	path = deps/buffer
+	url = git://github.com/typester/buffer.git
+[submodule "deps/picohttpparser"]
+	path = deps/picohttpparser
+	url = git://github.com/kazuho/picohttpparser.git
