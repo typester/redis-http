@@ -439,8 +439,7 @@ int main(int argc, char** argv) {
 
     http_server_listen(server, http_port);
 
-    server->data = (void*)c;
-    c->data      = (void*)server;
+    c->data = (void*)server;
 
     printf("Launched redis-http (%s:%d) proxying redis (%s:%d)\n",
         http_address, http_port, redis_address, redis_port);
