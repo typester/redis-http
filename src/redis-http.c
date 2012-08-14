@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -27,8 +28,10 @@
 /* default options */
 static uint16_t http_port;
 static sds http_address;
+static sds http_socket;
 static uint16_t redis_port;
 static sds redis_address;
+static sds redis_socket;
 
 typedef struct http_server_s http_server_t;
 typedef struct http_conn_s http_conn_t;
@@ -101,7 +104,13 @@ void usage() {
 }
 
 static redisAsyncContext* redis_connect(void) {
-    redisAsyncContext* c = redisAsyncConnect(redis_address, redis_port);
+    redisAsyncContext* c;
+    if (redis_socket) {
+        c = redisAsyncConnectUnix(redis_socket);
+    }
+    else {
+        c = redisAsyncConnect(redis_address, redis_port);
+    }
     if (c->err) {
         fprintf(stderr, "Failed to connect redis server %s:%d: %s\n",
             redis_address, redis_port, c->errstr);
@@ -208,8 +217,10 @@ static void redis_data_cb(redisAsyncContext* c, void* r, void* privdata) {
 static void setup_sock(int fd) {
     int on = 1, r;
 
-    r = setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
-    assert(r == 0);
+    if (NULL == http_socket) {
+        r = setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
+        assert(r == 0);
+    }
     r = fcntl(fd, F_SETFL, O_NONBLOCK);
     assert(r == 0);
 }
@@ -371,7 +382,7 @@ static void http_conn_close(http_conn_t* conn) {
     }
 }
 
-static void http_server_listen(http_server_t* server, uint16_t port) {
+static void http_server_listen(http_server_t* server) {
     int listen_sock = 0, r, flag = 1;
 
     sds ports = sdsnew(getenv("SERVER_STARTER_PORT"));
@@ -399,6 +410,10 @@ static void http_server_listen(http_server_t* server, uint16_t port) {
                 sdsfree(http_address);
                 http_address = sdsnew("0.0.0.0");
                 http_port    = atoi(port_fd[0]);
+                if (0 == http_port) {
+                    if (http_socket) sdsfree(http_socket);
+                    http_socket = sdsnew(port_fd[0]);
+                }
             }
             sdsfreesplitres(host_port, host_port_count);
 
@@ -412,18 +427,38 @@ static void http_server_listen(http_server_t* server, uint16_t port) {
     sdsfree(ports);
 
     if (0 == listen_sock) {
-        listen_sock = socket(AF_INET, SOCK_STREAM, 0);
-        assert(-1 != listen_sock);
+        if (http_socket) {
+            listen_sock = socket(AF_UNIX, SOCK_STREAM, 0);
+            assert(-1 != listen_sock);
 
-        r = setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(flag));
-        assert(0 == r);
+            r = setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(flag));
+            assert(0 == r);
 
-        struct sockaddr_in listen_addr;
-        listen_addr.sin_family      = AF_INET;
-        listen_addr.sin_port        = htons(port);
-        listen_addr.sin_addr.s_addr = 0; /* ANY */
-        r = bind(listen_sock, (struct sockaddr*)&listen_addr, sizeof(listen_addr));
-        assert(0 == r);
+            struct sockaddr_un listen_addr;
+            memset(&listen_addr, 0, sizeof(listen_addr));
+            strlcpy(listen_addr.sun_path, http_socket, sizeof(listen_addr.sun_path));
+            listen_addr.sun_family = AF_UNIX;
+            unlink(listen_addr.sun_path);
+            r = bind(listen_sock, (struct sockaddr*)&listen_addr, sizeof(listen_addr));
+            if (r) {
+                fprintf(stderr, "bind failed: %d, %s\n", errno, strerror(errno));
+            }
+            assert(0 == r);
+        }
+        else {
+            listen_sock = socket(AF_INET, SOCK_STREAM, 0);
+            assert(-1 != listen_sock);
+
+            r = setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(flag));
+            assert(0 == r);
+
+            struct sockaddr_in listen_addr;
+            listen_addr.sin_family      = AF_INET;
+            listen_addr.sin_port        = htons(http_port);
+            listen_addr.sin_addr.s_addr = 0; /* ANY */
+            r = bind(listen_sock, (struct sockaddr*)&listen_addr, sizeof(listen_addr));
+            assert(0 == r);
+        }
     }
 
     r = listen(listen_sock, 128);
@@ -459,8 +494,10 @@ static void sigtermHandler(int sig) {
 int main(int argc, char** argv) {
     http_port     = 6380;
     http_address  = sdsnew("0.0.0.0");
+    http_socket   = NULL;
     redis_port    = 6379;
     redis_address = sdsnew("127.0.0.1");
+    redis_socket  = NULL;
 
     if (argc >= 2) {
         int j = 1;
@@ -493,12 +530,21 @@ int main(int argc, char** argv) {
                     sdsfree(http_address);
                     http_address = sdsnew(argv[j]);
                 }
+                else if (0 == strcmp(option, "socket")) {
+                    http_socket = sdsnew(argv[j]);
+                }
                 else if (0 == strcmp(option, "redis-port")) {
                     redis_port = atoi(argv[j]);
                 }
                 else if (0 == strcmp(option, "redis-address")) {
                     sdsfree(redis_address);
                     redis_address = sdsnew(argv[j]);
+                }
+                else if (0 == strcmp(option, "redis-socket")) {
+                    redis_socket = sdsnew(argv[j]);
+                }
+                else {
+                    fprintf(stderr, "Unknown option: %s\n", option);
                 }
 
                 sdsfree(option);
@@ -518,14 +564,23 @@ int main(int argc, char** argv) {
     http_server_t* server = http_server_init();
     assert(server);
 
-    http_server_listen(server, http_port);
+    http_server_listen(server);
 
     c->data = (void*)server;
     instance = server;
 
-    printf("Launched redis-http (%s:%d) proxying redis (%s:%d)\n",
-        http_address, http_port, redis_address, redis_port);
-
+    if (http_socket) {
+        printf("Launched redis-http (unix:%s) ", http_socket);
+    }
+    else {
+        printf("Launched redis-http (%s:%d) ", http_address, http_port);
+    }
+    if (redis_socket) {
+        printf("proxying redis (unix:%s)\n", redis_socket);
+    }
+    else {
+        printf("proxying redis (%s:%d)\n", redis_address, redis_port);
+    }
 
     signal(SIGHUP, SIG_IGN);
     signal(SIGPIPE, SIG_IGN);
@@ -540,6 +595,11 @@ int main(int argc, char** argv) {
     ev_loop(EV_DEFAULT_ 0);
 
     http_server_free(server);
+
+    sdsfree(http_address);
+    sdsfree(redis_address);
+    if (http_socket) sdsfree(http_socket);
+    if (redis_socket) sdsfree(redis_socket);
 
     return 0;
 }
