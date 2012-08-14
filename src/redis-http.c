@@ -372,20 +372,58 @@ static void http_conn_close(http_conn_t* conn) {
 }
 
 static void http_server_listen(http_server_t* server, uint16_t port) {
-    int listen_sock, r, flag = 1;
+    int listen_sock = 0, r, flag = 1;
 
-    listen_sock = socket(AF_INET, SOCK_STREAM, 0);
-    assert(-1 != listen_sock);
+    sds ports = sdsnew(getenv("SERVER_STARTER_PORT"));
+    if (sdslen(ports)) {
+        int count, pair_count;
+        sds* pairs = sdssplitlen(ports, sdslen(ports), ";", 1, &count);
+        for (int i = 0; i < count; i++) {
+            sds* port_fd = sdssplitlen(pairs[i], sdslen(pairs[i]), "=", 1, &pair_count);
+            if (pair_count < 2) {
+                sdsfreesplitres(port_fd, pair_count);
+                continue;
+            }
 
-    r = setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(flag));
-    assert(0 == r);
+            int host_port_count;
+            sds* host_port = sdssplitlen(port_fd[0], sdslen(port_fd[0]),
+                ":", 1, &host_port_count);
 
-    struct sockaddr_in listen_addr;
-    listen_addr.sin_family      = AF_INET;
-    listen_addr.sin_port        = htons(port);
-    listen_addr.sin_addr.s_addr = 0; /* ANY */
-    r = bind(listen_sock, (struct sockaddr*)&listen_addr, sizeof(listen_addr));
-    assert(0 == r);
+            if (host_port_count >= 2) {
+                sdsfree(http_address);
+                http_address = sdsnew(host_port[ host_port_count - 1 - 1 ]);
+                http_port    = atoi(host_port[ host_port_count - 1 ]);
+            }
+            else {
+                sdsfree(http_address);
+                http_address = sdsnew("0.0.0.0");
+                http_port    = atoi(port_fd[0]);
+            }
+            sdsfreesplitres(host_port, host_port_count);
+
+            listen_sock = atoi(port_fd[1]);
+
+            sdsfreesplitres(port_fd, pair_count);
+            break;
+        }
+        sdsfreesplitres(pairs, count);
+    }
+    sdsfree(ports);
+
+    if (0 == listen_sock) {
+        listen_sock = socket(AF_INET, SOCK_STREAM, 0);
+        assert(-1 != listen_sock);
+
+        r = setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(flag));
+        assert(0 == r);
+
+        struct sockaddr_in listen_addr;
+        listen_addr.sin_family      = AF_INET;
+        listen_addr.sin_port        = htons(port);
+        listen_addr.sin_addr.s_addr = 0; /* ANY */
+        r = bind(listen_sock, (struct sockaddr*)&listen_addr, sizeof(listen_addr));
+        assert(0 == r);
+    }
 
     r = listen(listen_sock, 128);
     assert(0 == r);
