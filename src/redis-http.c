@@ -23,6 +23,12 @@
 #include "buffer.h"
 #include "picohttpparser.h"
 
+/* default options */
+static uint16_t http_port;
+static sds http_address;
+static uint16_t redis_port;
+static sds redis_address;
+
 typedef struct http_server_s http_server_t;
 typedef struct http_conn_s http_conn_t;
 
@@ -30,6 +36,7 @@ struct http_server_s {
     int fd;
     ngx_queue_t connections;
     ev_io ev_read;
+    ev_timer reconnect_timer;
 
     void* data;
 };
@@ -52,6 +59,10 @@ struct http_conn_s {
 static http_conn_t* http_conn_init(int fd);
 static void http_conn_close(http_conn_t* conn);
 
+static void redis_connect_cb(const redisAsyncContext* c, int status);
+static void redis_disconnect_cb(const redisAsyncContext* c, int status);
+static void redis_reconnect(http_server_t* server);
+
 static const char* const BAD_REQUEST =
     "HTTP/1.0 400 Bad Request\r\n"
     "Content-Type: text/plain\r\n"
@@ -68,6 +79,14 @@ static const char* const NOT_FOUND =
     "Not Found";
 static const size_t NOT_FOUND_LEN = 80;
 
+static const char* const BAD_GATEWAY =
+    "HTTP/1.0 502 Bad Gateway\r\n"
+    "Content-Type: text/plain\r\n"
+    "Content-Length: 11\r\n"
+    "\r\n"
+    "Bad Gateway";
+static const size_t BAD_GATEWAY_LEN = 85;
+
 static const char* const OK_HDR =
     "HTTP/1.0 200 OK\r\n";
 static const size_t OK_HDR_LEN = 17;
@@ -77,20 +96,67 @@ void usage() {
     exit(1);
 }
 
-static void redis_connect_cb(const redisAsyncContext *c, int status) {
-    if (status != REDIS_OK) {
-        fprintf(stderr, "redis connect error: %s\n", c->errstr);
-        return;
+static redisAsyncContext* redis_connect(void) {
+    redisAsyncContext* c = redisAsyncConnect(redis_address, redis_port);
+    if (c->err) {
+        fprintf(stderr, "Failed to connect redis server %s:%d: %s\n",
+            redis_address, redis_port, c->errstr);
+        redisAsyncFree(c);
+        return NULL;
     }
-    fprintf(stderr, "connected to redis\n");
+
+    redisLibevAttach(EV_DEFAULT_ c);
+    redisAsyncSetConnectCallback(c, redis_connect_cb);
+    redisAsyncSetDisconnectCallback(c, redis_disconnect_cb);
+
+    return c;
 }
 
-static void redis_disconnect_cb(const redisAsyncContext *c, int status) {
+static void redis_reconnect_cb(EV_P_ ev_timer* w, int revents) {
+    ev_timer_stop(EV_A_ w);
+
+    http_server_t* server = (http_server_t*)
+        (((char*)w) - offsetof(http_server_t, reconnect_timer));
+
+    redisAsyncContext* c = redis_connect();
+    if (c) {
+        c->data = (void*)server;
+    }
+    else {
+        redis_reconnect(server);
+    }
+}
+
+static void redis_reconnect(http_server_t* server) {
+    ev_timer_set(&server->reconnect_timer, 2., 0.);
+    ev_timer_start(EV_DEFAULT_ &server->reconnect_timer);
+}
+
+static void redis_connect_cb(const redisAsyncContext* c, int status) {
+    http_server_t* server = (http_server_t*)c->data;
+
     if (status != REDIS_OK) {
-        fprintf(stderr, "redis error: %d %s\n", status, c->errstr);
+        fprintf(stderr, "redis connect error: %s\n", c->errstr);
+        redis_reconnect(server);
         return;
     }
-    fprintf(stderr, "disconnected from redis\n");
+    printf("Connected redis-server (%s:%d)\n", redis_address, redis_port);
+
+    server->data = (void*)c;
+}
+
+static void redis_disconnect_cb(const redisAsyncContext* c, int status) {
+    if (status != REDIS_OK) {
+        fprintf(stderr, "redis error: %d %s\n", status, c->errstr);
+    }
+    else {
+        fprintf(stderr, "disconnected from redis\n");
+    }
+
+    http_server_t* server = (http_server_t*)c->data;
+    server->data = NULL;
+
+    redis_reconnect(server);
 }
 
 static void redis_data_cb(redisAsyncContext* c, void* r, void* privdata) {
@@ -190,11 +256,18 @@ static void http_conn_read_cb(EV_P_ ev_io* w, int revents) {
         if (r >= 0) {
             if (0 == strncmp(method, "GET", method_len) && path_len > 1) {
                 redisAsyncContext* c = (redisAsyncContext*)conn->server->data;
-                redisAsyncCommand(c, redis_data_cb, conn, "GET %b", path + 1, path_len - 1);
-                conn->flags = conn->flags | HTTP_CONN_WAIT_REDIS;
+                if (c) {
+                    redisAsyncCommand(c, redis_data_cb, conn, "GET %b", path + 1, path_len - 1);
+                    conn->flags = conn->flags | HTTP_CONN_WAIT_REDIS;
+                }
+                else {
+                    write(conn->fd, BAD_GATEWAY, BAD_GATEWAY_LEN);
+                    conn->flags = conn->flags | HTTP_CONN_ERR;
+                    http_conn_close(conn);
+                }
             }
             else {
-                write(conn->fd, BAD_REQUEST, strlen(BAD_REQUEST));
+                write(conn->fd, BAD_REQUEST, BAD_REQUEST_LEN);
                 conn->flags = conn->flags | HTTP_CONN_ERR;
                 http_conn_close(conn);
             }
@@ -204,7 +277,7 @@ static void http_conn_read_cb(EV_P_ ev_io* w, int revents) {
             return;
         }
         else if (-1 == r) {
-            write(conn->fd, BAD_REQUEST, strlen(BAD_REQUEST));
+            write(conn->fd, BAD_REQUEST, BAD_REQUEST_LEN);
             conn->flags = conn->flags | HTTP_CONN_ERR;
             http_conn_close(conn);
         }
@@ -241,6 +314,8 @@ static http_server_t* http_server_init() {
 
     server->fd = 0;
     ngx_queue_init(&server->connections);
+
+    ev_timer_init(&server->reconnect_timer, redis_reconnect_cb, 2., 0.);
 
     return server;
 }
@@ -301,12 +376,10 @@ static void http_server_listen(http_server_t* server, uint16_t port) {
 }
 
 int main(int argc, char** argv) {
-    /* default options */
-    uint16_t port = 6380;
-    sds address   = sdsnew("0.0.0.0");
-
-    uint16_t redis_port = 6379;
-    sds redis_address   = sdsnew("127.0.0.1");
+    http_port     = 6380;
+    http_address  = sdsnew("0.0.0.0");
+    redis_port    = 6379;
+    redis_address = sdsnew("127.0.0.1");
 
     if (argc >= 2) {
         int j = 1;
@@ -333,11 +406,11 @@ int main(int argc, char** argv) {
                 }
 
                 if (0 == strcmp(option, "port")) {
-                    port = atoi(argv[j]);
+                    http_port = atoi(argv[j]);
                 }
                 else if (0 == strcmp(option, "address")) {
-                    sdsfree(address);
-                    address = sdsnew(argv[j]);
+                    sdsfree(http_address);
+                    http_address = sdsnew(argv[j]);
                 }
                 else if (0 == strcmp(option, "redis-port")) {
                     redis_port = atoi(argv[j]);
@@ -355,23 +428,22 @@ int main(int argc, char** argv) {
     }
 
     /* redis client */
-    redisAsyncContext* c = redisAsyncConnect(redis_address, redis_port);
-    if (c->err) {
-        fprintf(stderr, "Error: %s\n", c->errstr);
+    redisAsyncContext* c = redis_connect();
+    if (NULL == c) {
         return -1;
     }
-
-    redisLibevAttach(EV_DEFAULT_ c);
-    redisAsyncSetConnectCallback(c, redis_connect_cb);
-    redisAsyncSetDisconnectCallback(c, redis_disconnect_cb);
 
     /* http server */
     http_server_t* server = http_server_init();
     assert(server);
 
-    http_server_listen(server, port);
+    http_server_listen(server, http_port);
 
     server->data = (void*)c;
+    c->data      = (void*)server;
+
+    printf("Launched redis-http (%s:%d) proxying redis (%s:%d)\n",
+        http_address, http_port, redis_address, redis_port);
 
     /* main loop */
     ev_loop(EV_DEFAULT_ 0);
